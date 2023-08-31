@@ -52,6 +52,7 @@ from .utils import (
 from .types import Int, UInt, Index, Float, Fixed, UFixed, Struct
 from .visitor import ASTVisitor, ASTContext
 from .symbol_resolver import ASTResolver
+import numpy as np
 
 
 class ASTBuilder(ASTVisitor):
@@ -1267,6 +1268,7 @@ class ASTTransformer(ASTBuilder):
                 "copy",
                 "transpose",
                 "linear",
+                "view",
             }:
                 return ASTTransformer.build_library_op(
                     ctx, node=node, attr=fn_name, new_args=new_args
@@ -1326,6 +1328,86 @@ class ASTTransformer(ASTBuilder):
             )
             # build linalg op
             if attr in {"matmul", "bmm", "add", "sub", "mul", "div"}:
+                if attr == "matmul" and len(shape) >= 3:
+                    shaped = new_args
+                    if len(node.f_shapes[0]) == len(node.f_shapes[1]):
+                        for i in range(2):
+                            new_args[i] = ASTTransformer.build_library_op(
+                                ctx,
+                                node,
+                                "view",
+                                [new_args[i], node.f_shapes[i]],
+                                shape=node.f_shapes[i],
+                            )
+                    elif len(node.f_shapes[0]) > len(node.f_shapes[1]):
+                        new_args[1] = ASTTransformer.build_broadcast_op(
+                            ctx,
+                            new_args[1],
+                            dtype,
+                            node.f_shapes[1],
+                            [node.f_shapes[0][0]] + node.f_shapes[1],
+                            [0],
+                        )
+                        node.f_shapes[1] = [node.f_shapes[0][0]] + node.f_shapes[1]
+                    # for i in range(2):
+                    #     if len(node.argshape[i]) < len(node.f_shapes[i]):
+                    #         print(node.f_shapes[i],
+                    #             [node.f_shapes[0][0]]+node.f_shapes[i][1:],
+                    #             node.argshape[i])
+                    #         shaped[i] = ASTTransformer.build_broadcast_op(
+                    #             ctx,
+                    #             new_args[i],
+                    #             dtype,
+                    #             node.argshape[i],
+                    #             [node.f_shapes[0][0]]+list(node.argshape[i]),
+                    #             [0],
+                    #         )
+                    #     if list(node.argshape[i]) != node.f_shapes[i] and not shape[i] :
+                    #         shaped[i] = ASTTransformer.build_library_op(
+                    #             ctx,
+                    #             node,
+                    #             "view",
+                    #             [shaped[i], node.f_shapes[i]],
+                    #             shape=node.f_shapes[i],
+                    #         )
+                    #     shaped[i] = shaped[i] if shaped[i] else new_args[i]
+                    #     print(shaped[i])
+                    # if node.f_shapes[0] != node.f_shapes[0]:
+                    #         f_A = ASTTransformer.build_library_op(
+                    #             ctx,
+                    #             node,
+                    #             "view",
+                    #             [new_args[0], node.f_shapes[0]],
+                    #             shape=node.f_shapes[0],
+                    #         )
+                    #     if node.f_shapes[1][0] != node.f_shapes[0][0]:
+                    #         f_B = ASTTransformer.build_broadcast_op(
+                    #             ctx,
+                    #             new_args[1],
+                    #             dtype,
+                    #             node.f_shapes[1],
+                    #             node.f_shapes[0],
+                    #             [0],
+                    #         )
+                    #     else:
+                    #         f_B = ASTTransformer.build_library_op(
+                    #             ctx,
+                    #             node,
+                    #             "view",
+                    #             [new_args[1], node.f_shapes[1]],
+                    #             shape=node.f_shapes[1],
+                    #         )
+                    result = ASTTransformer.build_library_op(
+                        ctx,
+                        node,
+                        "bmm",
+                        new_args,
+                        shape=node.f_shapes[0][:-1] + node.f_shapes[1][-1:],
+                    )
+                    op = ASTTransformer.build_library_op(
+                        ctx, node, "view", [result, node.shape]
+                    )
+                    return op
                 op = {
                     "matmul": linalg_d.matmul,
                     "bmm": linalg_d.batch_matmul,
@@ -1371,23 +1453,66 @@ class ASTTransformer(ASTBuilder):
                     outputs=[
                         result_tensor if ctx.enable_tensor else result_tensor.result
                     ],
-                    permutation=tuple(x.val for x in new_args[1]),
+                    permutation=node.perm,
                     ip=ctx.get_ip(),
                 )
+            elif attr == "view":
+                view_op = (
+                    tensor_d.ReshapeOp if ctx.enable_tensor else memref_d.ReshapeOp
+                )
+                if MockConstant not in [type(x) for x in new_args[1]]:
+                    value = np.asarray(new_args[1])
+                else:
+                    value = np.asarray(tuple(x.val for x in new_args[1]))
+                value_attr = DenseElementsAttr.get(value)
+                sym_name = StringAttr.get(
+                    f"{node.args[0].id}_{ctx.shape_buffers}_shaped"
+                )
+                memref_type = MemRefType.get(
+                    list(value.shape), IntegerType.get_signless(64)
+                )
+                type_attr = TypeAttr.get(memref_type)
+                memref_d.GlobalOp(
+                    sym_name=sym_name,
+                    type_=type_attr,
+                    initial_value=value_attr,
+                    constant=True,
+                    ip=InsertionPoint(ctx.top_func),
+                )
+                shape_value = memref_d.GetGlobalOp(
+                    memref_type,
+                    FlatSymbolRefAttr.get(
+                        f"{node.args[0].id}_{ctx.shape_buffers}_shaped"
+                    ),
+                    ip=ctx.get_ip(),
+                )
+                ctx.shape_buffers += 1
+                shaped_type = ASTTransformer.build_shaped_type(ctx, dtype, shape)
+                op = view_op(
+                    source=new_args[0].result,
+                    result=shaped_type,
+                    shape=shape_value.result,
+                    ip=ctx.get_ip(),
+                )
+                return op
             elif attr == "linear":  # X @ A.T + B
-                permutation = [MockConstant(val, ctx) for val in (1, 0)]
                 A_T = ASTTransformer.build_library_op(
                     ctx,
                     node,
                     "transpose",
-                    [new_args[1], permutation],
+                    [new_args[1]],
                     shape=node.args[1].shape[::-1],
                 )
                 matmul = ASTTransformer.build_library_op(
                     ctx, node, "matmul", [new_args[0], A_T]
                 )
+                # TODO:dimension[0],[1,0]
+                dim = []
+                for i in range(len(node.shape) - 1):
+                    dim.append(i)
+                print(dim)
                 bias = ASTTransformer.build_broadcast_op(
-                    ctx, new_args[2], node.dtype, node.shape[-1:], node.shape, [0]
+                    ctx, new_args[2], node.dtype, node.shape[-1:], node.shape, dim
                 )
                 add = ASTTransformer.build_library_op(ctx, node, "add", [matmul, bias])
                 return add
