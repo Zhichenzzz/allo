@@ -51,7 +51,9 @@ from .utils import (
 )
 from .types import Int, UInt, Index, Float, Fixed, UFixed, Struct
 from .visitor import ASTVisitor, ASTContext
+from .infer import TypeInferer
 from .symbol_resolver import ASTResolver
+import numpy as np
 
 
 class ASTBuilder(ASTVisitor):
@@ -607,18 +609,28 @@ class ASTTransformer(ASTBuilder):
         return store_op
 
     @staticmethod
-    def build_constant_tensor(ctx, node):
-        np_values = node.np_values
+    def build_constant_tensor(
+        ctx, node, shape=None, dtype=None, constant=False, np_values=None
+    ):
+        if np_values is None:
+            np_values = node.np_values
         value_attr = DenseElementsAttr.get(np_values)
+        dtype = dtype if dtype is not None else node.dtype.build()
+        shape = shape if shape is not None else node.shape
         if ctx.enable_tensor:
-            shape, dtype = node.shape, node.dtype
-            tensor_type = RankedTensorType.get(shape, dtype.build())
+            # shape, dtype = node.shape, node.dtype
+            tensor_type = RankedTensorType.get(shape, dtype)
             # pylint: disable=too-many-function-args
             const_tensor = arith_d.ConstantOp(tensor_type, value_attr, ip=ctx.get_ip())
         else:
-            sym_name = StringAttr.get(node.target.id)
+            if hasattr(node, "target"):
+                name = node.target.id
+            else:
+                name = f"const_{ctx.shape_buffers}"
+                ctx.shape_buffers += 1
+            sym_name = StringAttr.get(name)
             sym_visibility = StringAttr.get("private")
-            memref_type = MemRefType.get(np_values.shape, node.dtype.build())
+            memref_type = MemRefType.get(shape, dtype)
             type_attr = TypeAttr.get(memref_type)
             # pylint: disable=redefined-variable-type
             const_tensor = memref_d.GlobalOp(
@@ -628,13 +640,13 @@ class ASTTransformer(ASTBuilder):
                 initial_value=value_attr,
                 # TODO: Use dataflow analysis to determine whether some store ops
                 #       are operated on this tensor
-                constant=False,
+                constant=constant,
                 alignment=None,
                 ip=InsertionPoint(ctx.top_func),
             )
             const_tensor = memref_d.GetGlobalOp(
                 memref_type,
-                FlatSymbolRefAttr.get(node.target.id),
+                FlatSymbolRefAttr.get(name),
                 ip=ctx.get_ip(),
             )
         return const_tensor
@@ -1274,6 +1286,7 @@ class ASTTransformer(ASTBuilder):
                 "copy",
                 "transpose",
                 "linear",
+                "view",
             }:
                 return ASTTransformer.build_library_op(
                     ctx, node=node, attr=fn_name, new_args=new_args
@@ -1343,6 +1356,39 @@ class ASTTransformer(ASTBuilder):
                 "maxpool",
                 "sumpool",
             }:
+                if attr == "matmul" and len(shape) >= 3:
+                    if len(node.f_shapes[0]) == len(node.f_shapes[1]):
+                        for i in range(2):
+                            new_args[i] = ASTTransformer.build_library_op(
+                                ctx,
+                                node,
+                                "view",
+                                [new_args[i], node.f_shapes[i]],
+                                shape=node.f_shapes[i],
+                            )
+                    elif len(node.f_shapes[0]) > len(node.f_shapes[1]):
+                        new_args[1] = ASTTransformer.build_broadcast_op(
+                            ctx,
+                            new_args[1],
+                            dtype,
+                            node.f_shapes[1],
+                            [node.f_shapes[0][0]] + node.f_shapes[1],
+                            [0],
+                        )
+                        node.f_shapes[1] = [node.f_shapes[0][0]] + node.f_shapes[1]
+                    else:
+                        RuntimeError("Unsupported matmul shape")
+                    result = ASTTransformer.build_library_op(
+                        ctx,
+                        node,
+                        "bmm",
+                        new_args,
+                        shape=node.f_shapes[0][:-1] + node.f_shapes[1][-1:],
+                    )
+                    op = ASTTransformer.build_library_op(
+                        ctx, node, "view", [result, node.shape]
+                    )
+                    return op
                 op = {
                     "matmul": linalg_d.matmul,
                     "bmm": linalg_d.batch_matmul,
@@ -1391,23 +1437,49 @@ class ASTTransformer(ASTBuilder):
                     outputs=[
                         result_tensor if ctx.enable_tensor else result_tensor.result
                     ],
-                    permutation=tuple(x.val for x in new_args[1]),
+                    permutation=node.perm,
                     ip=ctx.get_ip(),
                 )
+            elif attr == "view":
+                view_op = (
+                    tensor_d.ReshapeOp if ctx.enable_tensor else memref_d.ReshapeOp
+                )
+                if MockConstant not in [type(x) for x in new_args[1]]:
+                    value = np.array(new_args[1])
+                else:
+                    value = np.array(tuple(x.val for x in new_args[1]))
+                shape_value = ASTTransformer.build_constant_tensor(
+                    ctx,
+                    node,
+                    shape=value.shape,
+                    dtype=IntegerType.get_signless(64),
+                    np_values=value,
+                    constant=True,
+                )
+                shaped_type = ASTTransformer.build_shaped_type(ctx, dtype, shape)
+                op = view_op(
+                    source=new_args[0].result,
+                    result=shaped_type,
+                    shape=shape_value.result,
+                    ip=ctx.get_ip(),
+                )
+                return op
             elif attr == "linear":  # X @ A.T + B
-                permutation = [MockConstant(val, ctx) for val in (1, 0)]
                 A_T = ASTTransformer.build_library_op(
                     ctx,
                     node,
                     "transpose",
-                    [new_args[1], permutation],
+                    [new_args[1]],
                     shape=node.args[1].shape[::-1],
                 )
                 matmul = ASTTransformer.build_library_op(
                     ctx, node, "matmul", [new_args[0], A_T]
                 )
+                dim = []
+                for i in range(len(node.shape) - 1):
+                    dim.append(i)
                 bias = ASTTransformer.build_broadcast_op(
-                    ctx, new_args[2], node.dtype, node.shape[-1:], node.shape, [0]
+                    ctx, new_args[2], node.dtype, node.shape[-1:], node.shape, dim
                 )
                 add = ASTTransformer.build_library_op(ctx, node, "add", [matmul, bias])
                 return add
