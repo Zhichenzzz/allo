@@ -1440,7 +1440,7 @@ class ASTTransformer(ASTBuilder):
                     input=new_args[0].result,
                     dimension=1,
                     result=[],
-                    output=alloc_op,
+                    output=result_tensor if ctx.enable_tensor else result_tensor.result,
                 )
             elif attr == "relu":
                 # TODO: Need to better manage library call

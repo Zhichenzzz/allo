@@ -3,14 +3,23 @@
 # pylint: disable=no-name-in-module
 
 import numpy as np
-
+import allo
 import hcl_mlir
-from hcl_mlir.ir import UnitAttr, StringAttr, InsertionPoint, MemRefType, AffineMapAttr
+from hcl_mlir.ir import (
+    UnitAttr,
+    StringAttr,
+    InsertionPoint,
+    MemRefType,
+    AffineMapAttr,
+    FlatSymbolRefAttr,
+    Location,
+)
 from hcl_mlir.dialects import (
     memref as memref_d,
     affine as affine_d,
     scf as scf_d,
     func as func_d,
+    linalg as linalg_d,
 )
 
 
@@ -231,3 +240,79 @@ def find_func_in_module(module, func_name):
         if isinstance(op, func_d.FuncOp) and op.name.value == func_name:
             return op
     return None
+
+def softmax_func(module, ctx):
+    softmax_module = """
+#map0 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#map1 = affine_map<(d0, d1, d2) -> (d0, d1)>
+func.func @softmax(%A: memref<2x16x32xf32>, %B: memref<2x16x32xf32>) -> memref<2x16x32xf32> {
+        %0 = memref.alloc() : memref<2x16xf32>
+        %C0_f32 = arith.constant 0xFF800000 : f32
+        linalg.fill ins(%C0_f32 : f32) outs(%0 : memref<2x16xf32>)
+        linalg.generic {indexing_maps = [#map0, #map1], iterator_types = ["parallel",
+      "parallel", "reduction"]} ins(%A : memref<2x16x32xf32>) outs(%0 : memref<2x16xf32>) {
+          ^bb0(%IN: f32, %OUT: f32):
+            %7 = arith.maxf %IN, %OUT : f32
+            linalg.yield %7 : f32
+          }
+        linalg.generic {indexing_maps = [#map0, #map1, #map0], iterator_types =
+      ["parallel", "parallel", "parallel"]} ins(%A, %0 : memref<2x16x32xf32>, memref<2x16xf32>)
+      outs(%B : memref<2x16x32xf32>) {
+          ^bb0(%IN1: f32, %IN2: f32, %OUT: f32):
+            %7 = arith.subf %IN1, %IN2 : f32
+            %8 = math.exp %7 : f32
+            linalg.yield %8 : f32
+          }
+          %1 = memref.alloc() : memref<2x16xf32>
+          %C1 = arith.constant 0.000000e+00 : f32
+          linalg.fill ins(%C1 : f32) outs(%1 : memref<2x16xf32>)
+          linalg.generic {indexing_maps = [#map0, #map1], iterator_types = ["parallel",
+      "parallel", "reduction"]} ins(%B : memref<2x16x32xf32>) outs(%1 : memref<2x16xf32>) {
+          ^bb0(%IN: f32, %OUT: f32):
+            %7 = arith.addf %IN, %OUT : f32
+            linalg.yield %7 : f32
+          }
+          linalg.generic {indexing_maps = [#map0, #map1, #map0], iterator_types =
+      ["parallel", "parallel", "parallel"]} ins(%B, %1 : memref<2x16x32xf32>, memref<2x16xf32>)
+      outs(%B : memref<2x16x32xf32>) {
+          ^bb0(%IN1: f32, %IN2: f32, %OUT: f32):
+            %7 = arith.divf %IN1, %IN2 : f32
+            linalg.yield %7 : f32
+          }
+          return %B : memref<2x16x32xf32>
+}
+"""
+    with module.context, Location.unknown():
+        # get softmax function
+        new_mod = allo.invoke_mlir_parser(softmax_module)
+        new_func = new_mod.body.operations[0]
+
+        # get all functions from origin module and find the function to replace
+        for op in module.body.operations:
+            if isinstance(op, func_d.FuncOp):
+                new_func.move_before(op)
+                print(module)
+                for func in op.entry_block.operations:
+                    if isinstance(func, linalg_d.SoftmaxOp):
+                        args = new_func.arguments
+                        # print(args[0].type)
+                        print(args[0], args[1], func.input, func.output)
+                        # print(args[0].replace_all_uses_with(func.input))
+                        with InsertionPoint(op):
+                            args[0].replace_all_uses_with(func.input)
+                            args[1].replace_all_uses_with(func.output)
+                        #     print(args[0], args[1], func.input, func.output)
+                        #     new_func.arguments.replace_all_uses_with(func.input, func.output) 
+                            
+                        call_op = func_d.CallOp(
+                            [func.output.type],
+                            FlatSymbolRefAttr.get("softmax"),
+                            [func.input, func.output],
+                            ip=InsertionPoint(func),
+                        )
+                        
+                        call_op.move_before(func)
+                        func.operation.erase()
+
+            print(module)
+            return module

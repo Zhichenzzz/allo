@@ -238,8 +238,9 @@ def test_linalg_softmax():
     # TODO: failed to lower to LLVM, see https://reviews.llvm.org/D153422
     M = 10
     K = 15
+    N = 20
 
-    def kernel(A: float32[M, K]) -> float32[M, K]:
+    def kernel(A: float32[M, K, N]) -> float32[M, K, N]:
         outs = allo.softmax(A)
         return outs
 
@@ -504,4 +505,5 @@ def test_library_higher_dimension_ops(enable_tensor):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    # pytest.main([__file__])
+    test_linalg_softmax()
