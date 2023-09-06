@@ -3,7 +3,7 @@
 # pylint: disable=no-name-in-module
 
 import numpy as np
-import allo
+import os
 import hcl_mlir
 from hcl_mlir.ir import (
     UnitAttr,
@@ -13,6 +13,13 @@ from hcl_mlir.ir import (
     AffineMapAttr,
     FlatSymbolRefAttr,
     Location,
+    Module,
+    FunctionType,
+    TypeAttr,
+    ArrayAttr,
+    Attribute,
+    RankedTensorType,
+    ShapedType,
 )
 from hcl_mlir.dialects import (
     memref as memref_d,
@@ -20,7 +27,10 @@ from hcl_mlir.dialects import (
     scf as scf_d,
     func as func_d,
     linalg as linalg_d,
+    tensor as tensor_d,
 )
+from .utils import MockConstant
+from .types import Int
 
 
 class LoopWrapper:
@@ -241,78 +251,125 @@ def find_func_in_module(module, func_name):
             return op
     return None
 
-def softmax_func(module, ctx):
-    softmax_module = """
-#map0 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
-#map1 = affine_map<(d0, d1, d2) -> (d0, d1)>
-func.func @softmax(%A: memref<2x16x32xf32>, %B: memref<2x16x32xf32>) -> memref<2x16x32xf32> {
-        %0 = memref.alloc() : memref<2x16xf32>
-        %C0_f32 = arith.constant 0xFF800000 : f32
-        linalg.fill ins(%C0_f32 : f32) outs(%0 : memref<2x16xf32>)
-        linalg.generic {indexing_maps = [#map0, #map1], iterator_types = ["parallel",
-      "parallel", "reduction"]} ins(%A : memref<2x16x32xf32>) outs(%0 : memref<2x16xf32>) {
-          ^bb0(%IN: f32, %OUT: f32):
-            %7 = arith.maxf %IN, %OUT : f32
-            linalg.yield %7 : f32
-          }
-        linalg.generic {indexing_maps = [#map0, #map1, #map0], iterator_types =
-      ["parallel", "parallel", "parallel"]} ins(%A, %0 : memref<2x16x32xf32>, memref<2x16xf32>)
-      outs(%B : memref<2x16x32xf32>) {
-          ^bb0(%IN1: f32, %IN2: f32, %OUT: f32):
-            %7 = arith.subf %IN1, %IN2 : f32
-            %8 = math.exp %7 : f32
-            linalg.yield %8 : f32
-          }
-          %1 = memref.alloc() : memref<2x16xf32>
-          %C1 = arith.constant 0.000000e+00 : f32
-          linalg.fill ins(%C1 : f32) outs(%1 : memref<2x16xf32>)
-          linalg.generic {indexing_maps = [#map0, #map1], iterator_types = ["parallel",
-      "parallel", "reduction"]} ins(%B : memref<2x16x32xf32>) outs(%1 : memref<2x16xf32>) {
-          ^bb0(%IN: f32, %OUT: f32):
-            %7 = arith.addf %IN, %OUT : f32
-            linalg.yield %7 : f32
-          }
-          linalg.generic {indexing_maps = [#map0, #map1, #map0], iterator_types =
-      ["parallel", "parallel", "parallel"]} ins(%B, %1 : memref<2x16x32xf32>, memref<2x16xf32>)
-      outs(%B : memref<2x16x32xf32>) {
-          ^bb0(%IN1: f32, %IN2: f32, %OUT: f32):
-            %7 = arith.divf %IN1, %IN2 : f32
-            linalg.yield %7 : f32
-          }
-          return %B : memref<2x16x32xf32>
-}
-"""
-    with module.context, Location.unknown():
-        # get softmax function
-        new_mod = allo.invoke_mlir_parser(softmax_module)
-        new_func = new_mod.body.operations[0]
 
+def softmax_implement(module, enable_tensor):
+    current_directory = os.path.dirname(os.path.realpath(__file__))
+    file_path = os.path.join(current_directory, f"softmax_impl.mlir")
+    with open(file_path, "r") as f:
+        softmax_module = f.read()
+    with module.context, Location.unknown():
         # get all functions from origin module and find the function to replace
         for op in module.body.operations:
             if isinstance(op, func_d.FuncOp):
-                new_func.move_before(op)
-                print(module)
-                for func in op.entry_block.operations:
-                    if isinstance(func, linalg_d.SoftmaxOp):
-                        args = new_func.arguments
-                        # print(args[0].type)
-                        print(args[0], args[1], func.input, func.output)
-                        # print(args[0].replace_all_uses_with(func.input))
-                        with InsertionPoint(op):
-                            args[0].replace_all_uses_with(func.input)
-                            args[1].replace_all_uses_with(func.output)
-                        #     print(args[0], args[1], func.input, func.output)
-                        #     new_func.arguments.replace_all_uses_with(func.input, func.output) 
-                            
-                        call_op = func_d.CallOp(
-                            [func.output.type],
-                            FlatSymbolRefAttr.get("softmax"),
-                            [func.input, func.output],
-                            ip=InsertionPoint(func),
+                # put softmax function into the module
+                for body_op in op.entry_block.operations:
+                    if isinstance(body_op, linalg_d.SoftmaxOp):
+                        # get softmax function
+                        softmax_mod = Module.parse(softmax_module)
+                        softmax_func = softmax_mod.body.operations[0]
+                        softmax_func.attributes["sym_name"] = StringAttr.get(
+                            f"softmax_{hash(body_op)}"
                         )
-                        
-                        call_op.move_before(func)
-                        func.operation.erase()
+                        args = softmax_func.arguments
+                        args[0].set_type(body_op.input.type)
+                        args[1].set_type(body_op.output.type)
+                        in_types = [args[0].type, args[1].type]
+                        out_types = [args[1].type]
+                        func_type = FunctionType.get(in_types, out_types)
+                        softmax_func.attributes["function_type"] = TypeAttr.get(
+                            func_type
+                        )
+                        softmax_func.move_before(op)
+                        func_d.CallOp(
+                            [body_op.output.type],
+                            FlatSymbolRefAttr.get(f"softmax_{hash(body_op)}"),
+                            [body_op.input, body_op.output],
+                            ip=InsertionPoint(body_op),
+                        )
+                        shape = (
+                            MemRefType(in_types[0]).shape
+                            if not enable_tensor
+                            else RankedTensorType(in_types[0]).shape
+                        )
+                        print(shape)
+                        for softmax_op in softmax_func.entry_block.operations:
+                            if isinstance(softmax_op, memref_d.AllocOp):
+                                alloc_op = memref_d.AllocOp(
+                                    MemRefType.get(
+                                        shape[:-1], MemRefType(in_types[0]).element_type
+                                    ),
+                                    [],
+                                    [],
+                                    ip=InsertionPoint(softmax_op),
+                                )
+                                softmax_op.result.replace_all_uses_with(alloc_op.result)
+                                softmax_op.operation.erase()
+                            elif isinstance(softmax_op, tensor_d.EmptyOp):
+                                alloc_op = tensor_d.EmptyOp(
+                                    shape[:-1],
+                                    ShapedType(in_types[0]).element_type,
+                                    ip=InsertionPoint(softmax_op),
+                                )
+                                softmax_op.result.replace_all_uses_with(alloc_op.result)
+                                softmax_op.operation.erase()
+                            elif (
+                                isinstance(softmax_op, linalg_d.FillOp)
+                                and enable_tensor
+                            ):
+                                with InsertionPoint(softmax_op):
+                                    
+                                    linalg_fill = linalg_d.fill(
+                                        softmax_op.inputs[0],
+                                        outs=[alloc_op.result],
+                                    )
+                                print(linalg_fill)
+                                softmax_op.result.replace_all_uses_with(linalg_fill)
+                                softmax_op.operation.erase()
+                                print(module)
 
-            print(module)
-            return module
+                            elif isinstance(softmax_op, linalg_d.GenericOp):
+                                var_str_0 = ", ".join(
+                                    [f"d{i}" for i in range(len(shape))]
+                                )
+                                var_str_1 = ", ".join(
+                                    [f"d{i}" for i in range(len(shape) - 1)]
+                                )
+                                affine_map_0 = AffineMapAttr.parse(
+                                    f"affine_map<({var_str_0})->({var_str_0})>"
+                                )
+                                affine_map_1 = AffineMapAttr.parse(
+                                    f"affine_map<({var_str_0})->({var_str_1})>"
+                                )
+                                iter_types_0 = [
+                                    Attribute.parse("#linalg.iterator_type<parallel>")
+                                ] * (len(shape) - 1) + [
+                                    Attribute.parse("#linalg.iterator_type<reduction>")
+                                ]
+                                iter_types_1 = [
+                                    Attribute.parse("#linalg.iterator_type<parallel>")
+                                ] * len(shape)
+                                if (
+                                    str(softmax_op.attributes["iterator_types"])
+                                    == "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<reduction>]"
+                                ):
+                                    softmax_op.attributes[
+                                        "indexing_maps"
+                                    ] = ArrayAttr.get([affine_map_0, affine_map_1])
+                                    softmax_op.attributes[
+                                        "iterator_types"
+                                    ] = ArrayAttr.get(iter_types_0)
+                                elif (
+                                    str(softmax_op.attributes["iterator_types"])
+                                    == "[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>]"
+                                ):
+                                    softmax_op.attributes[
+                                        "indexing_maps"
+                                    ] = ArrayAttr.get(
+                                        [affine_map_0, affine_map_1, affine_map_0]
+                                    )
+                                    softmax_op.attributes[
+                                        "iterator_types"
+                                    ] = ArrayAttr.get(iter_types_1)
+                        body_op.operation.erase()
+        print(module)
+        return module
