@@ -91,10 +91,15 @@ class TorchBuilder:
         pass
 
     def build_call_module(self, node):
+        print(self.get_module(node.target))
         if isinstance(self.get_module(node.target), torch.nn.Linear):
             op = "linear"
         elif isinstance(self.get_module(node.target), torch.nn.Dropout):
             op = "identity"
+        elif isinstance(self.get_module(node.target), torch.nn.GELU):
+            op = "gelu"
+        elif isinstance(self.get_module(node.target), torch.nn.LayerNorm):
+            op = "layernorm"
         else:
             raise NotImplementedError("Unsupported module")
         return getattr(self, f"build_{op}")(node)
@@ -150,10 +155,22 @@ class TorchBuilder:
         return f"{node.name} = dsl.relu({inp})"
 
     def build_linear(self, node):
+        target_name = node.target.replace(".", "_")
         inp = get_var_name(node.args[0])
-        weight = get_var_name(node.target + "_weight")
-        bias = get_var_name(node.target + "_bias")
+        weight = get_var_name(target_name + "_weight")
+        bias = get_var_name(target_name + "_bias")
         return f"{node.name} = dsl.linear({inp}, {weight}, {bias})"
+
+    def build_gelu(self, node):
+        inp = get_var_name(node.args[0])
+        return f"{node.name} = dsl.gelu({inp})"
+
+    def build_layernorm(self, node):
+        target_name = node.target.replace(".", "_")
+        inp = get_var_name(node.args[0])
+        weight = get_var_name(target_name + "_weight")
+        bias = get_var_name(target_name + "_bias")
+        return f"{node.name} = dsl.layernorm({inp}, {weight}, {bias})"
 
     def build_view(self, node):
         inp = get_var_name(node.args[0])
