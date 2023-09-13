@@ -9,7 +9,7 @@ seq_len = 512
 hidden_size = 768
 
 config = AutoConfig.from_pretrained("bert-base-uncased")
-model = BertLayer(config)
+model = BertLayer(config).eval()
 print(model)
 
 # trace module
