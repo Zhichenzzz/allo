@@ -18,28 +18,25 @@ from ..ir import types
 from ..customize import customize
 
 
-def from_pytorch(model, example_inputs, verbose=False):
-    concrete_args = {
-        "attention_self_dropout": None,
-        "output_attentions": True,
-        "past_key_value": None,
-        "attention_mask": None,
-        "head_mask": None,
-    }
+def from_pytorch(model, example_inputs, concrete_args=None, verbose=False):
+    args = []
+    args.append(*example_inputs)
+    if concrete_args is not None:
+        for item in concrete_args.values():
+            args.append(item)
 
     gm = fx.symbolic_trace(model, concrete_args=concrete_args)
 
     # Solution1: Removing eq and assert nodes
-    # nodes_to_remove = []
-    # for n in gm.graph.nodes:
-    #     if n.name in ["eq", "_assert"]:
-    #         nodes_to_remove.append(n)
-    # nodes_to_remove.reverse()
-    # for n in nodes_to_remove:
-    #     gm.graph.erase_node(n)
-    print(gm.graph)
-    # args = {"output_attentions": True,}
-    ShapeProp(gm).propagate(*example_inputs,concrete_args)
+    nodes_to_remove = []
+    for n in gm.graph.nodes:
+        if n.name == "_assert":
+            nodes_to_remove.append(n)
+    nodes_to_remove.reverse()
+    for n in nodes_to_remove:
+        gm.graph.erase_node(n)
+
+    ShapeProp(gm).propagate(*args)
     if verbose:
         print(gm.graph)
     global_vars = {}
@@ -157,7 +154,10 @@ class TorchBuilder:
 
     def build_output(self, node):
         name = get_var_name(node.args[0])
-        return f"return ({name[0]})"
+        if isinstance(name, tuple):
+            return f"return ({name[0]})"
+        elif isinstance(name, str):
+            return f"return ({name})"
 
     def build_add(self, node):
         lhs = get_var_name(node.args[0])

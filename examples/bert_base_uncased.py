@@ -1,21 +1,29 @@
-from transformers import AutoConfig, BertLMHeadModel, GPT2LMHeadModel, BertLayer
+from transformers import AutoConfig, BertLayer
 import torch
 import allo
 import numpy as np
 
-hidden_size = 768
-n_heads = 12
+
 batch_size = 2
-intermediate_size = 3072
 seq_len = 512
+hidden_size = 768
 
 config = AutoConfig.from_pretrained("bert-base-uncased")
 model = BertLayer(config)
 print(model)
+
+# trace module
 example_inputs = [torch.rand(batch_size, seq_len, hidden_size)]
+concrete_args = {
+    "past_key_value": None,
+    "attention_mask": None,
+    "head_mask": None,
+    "output_attentions": False,
+}
 llvm_mod = allo.frontend.from_pytorch(
-    model, example_inputs=example_inputs, verbose=True
+    model, example_inputs=example_inputs, concrete_args=concrete_args, verbose=True
 )
+
 golden = model(*example_inputs)
 np_inputs = [x.detach().numpy() for x in example_inputs]
 res = llvm_mod(*np_inputs)
