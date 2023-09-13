@@ -19,8 +19,27 @@ from ..customize import customize
 
 
 def from_pytorch(model, example_inputs, verbose=False):
-    gm = fx.symbolic_trace(model)
-    ShapeProp(gm).propagate(*example_inputs)
+    concrete_args = {
+        "attention_self_dropout": None,
+        "output_attentions": True,
+        "past_key_value": None,
+        "attention_mask": None,
+        "head_mask": None,
+    }
+
+    gm = fx.symbolic_trace(model, concrete_args=concrete_args)
+
+    # Solution1: Removing eq and assert nodes
+    # nodes_to_remove = []
+    # for n in gm.graph.nodes:
+    #     if n.name in ["eq", "_assert"]:
+    #         nodes_to_remove.append(n)
+    # nodes_to_remove.reverse()
+    # for n in nodes_to_remove:
+    #     gm.graph.erase_node(n)
+    print(gm.graph)
+    # args = {"output_attentions": True,}
+    ShapeProp(gm).propagate(*example_inputs,concrete_args)
     if verbose:
         print(gm.graph)
     global_vars = {}
@@ -115,19 +134,30 @@ class TorchBuilder:
             F.softmax: "softmax",
             F.relu: "relu",
             F.dropout: "identity",
+            F.linear: "linear",
+            F.gelu: "gelu",
         }.get(node.target)
         # Only nodes with shape need to be built.
+        if opcls is not None:
+            return (
+                getattr(self, f"build_{opcls}")(node)
+                if "tensor_meta" in node.meta
+                else None
+            )
+
+    def build_call_method(self, node):
+        if node.target == "contiguous":
+            return self.build_identity(node)
+        # return getattr(self, f"build_{node.target}")(node)
         return (
-            getattr(self, f"build_{opcls}")(node)
+            getattr(self, f"build_{node.target}")(node)
             if "tensor_meta" in node.meta
             else None
         )
 
-    def build_call_method(self, node):
-        return getattr(self, f"build_{node.target}")(node)
-
     def build_output(self, node):
-        return f"return {node.args[0]}"
+        name = get_var_name(node.args[0])
+        return f"return ({name[0]})"
 
     def build_add(self, node):
         lhs = get_var_name(node.args[0])
