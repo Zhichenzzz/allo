@@ -3,34 +3,34 @@
 
 import allo
 import torch
-import math
 from tqdm import tqdm
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2Tokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.activations import NewGELUActivation
 
 
-class GPT2(nn.Module):
+class GPTneo(nn.Module):
     def __init__(self, vocab_size, n_embd, n_head, n_layers):
-        super(GPT2, self).__init__()
+        super(GPTneo, self).__init__()
         self.transformer = nn.ModuleList(
             [TransformerBlock(n_embd, n_head, n_embd * 4) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-    def forward(self, x, kvcache=None):
+    def forward(self, x, kvcache):
         if not kvcache:
             kvcache = [None] * len(self.transformer)
-        new_kvcache = []
+        presents = () if kvcache else None
         for block, kvcache_block in zip(self.transformer, kvcache):
-            # print(x.shape)
             x, updated_cache = block(x, kvcache_block)
-            new_kvcache.append(updated_cache)
+            presents = presents + (updated_cache,)
 
         x = self.ln_f(x)
+
         x = self.lm_head(x)
-        return x, new_kvcache
+        return x, presents
 
 
 class TransformerBlock(nn.Module):
@@ -50,7 +50,6 @@ class TransformerBlock(nn.Module):
         ln_2 = self.ln_2(out1)
         ffn_output = self.mlp(ln_2)
         out2 = out1 + ffn_output
-
         return out2, kvcache_updated
 
 
@@ -59,7 +58,7 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.c_fc = nn.Linear(n_embd, hidden_dim)
         self.c_proj = nn.Linear(hidden_dim, output_dim)
-        self.activation = nn.GELU()
+        self.activation = NewGELUActivation()
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -73,17 +72,16 @@ class MultiHeadAttention(nn.Module):
         super(MultiHeadAttention, self).__init__()
         self.num_heads = num_heads
         self.head_dim = n_embd // num_heads
-        self.k_proj = nn.Linear(n_embd, n_embd)
-        self.v_proj = nn.Linear(n_embd, n_embd)
-        self.q_proj = nn.Linear(n_embd, n_embd)
-        self.c_proj = nn.Linear(n_embd, n_embd)
+        self.k_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.v_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.q_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.out_proj = nn.Linear(n_embd, n_embd)
 
     def mask(self, x, kvcache=None):
         if kvcache:
-            causal_mask = 0
-        else:
-            ones = torch.ones(x.size(1), x.size(1))
-            causal_mask = (1 - torch.tril(ones)) * -1e10
+            return 0
+        ones = torch.ones(x.size(1), x.size(1))
+        causal_mask = (1 - torch.tril(ones)) * -1e38
         return causal_mask
 
     def split_heads(self, x):
@@ -95,9 +93,7 @@ class MultiHeadAttention(nn.Module):
 
     def scaled_dot_product(self, q, k, v, x, kvcache=None):
         # (bs, head, seq, hs // head)
-        attn_score = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(
-            self.head_dim
-        ) + self.mask(x, kvcache)
+        attn_score = torch.matmul(q, k.transpose(-2, -1)) + self.mask(x, kvcache)
         # (bs, head, seq, seq)
         attn_probs = F.softmax(attn_score, dim=-1)
         # (bs, head, seq, hs // head)
@@ -119,7 +115,6 @@ class MultiHeadAttention(nn.Module):
             old_k, old_v = kvcache
             k = torch.cat([old_k, new_k], dim=-2)
             v = torch.cat([old_v, new_v], dim=-2)
-        # print(q.shape, k.shape, v.shape)
         current_cache = [k, v]
 
         # core attention
@@ -127,7 +122,7 @@ class MultiHeadAttention(nn.Module):
         # output: (bs, seq, head, hs // head)
         output = output.permute(0, 2, 1, 3)
         output = output.reshape(output.shape[0], output.shape[1], -1)
-        output = self.c_proj(output)
+        output = self.out_proj(output)
         return output, current_cache
 
 
@@ -143,7 +138,7 @@ class Embedding(nn.Module):
             input_tensor = input_ids
         else:
             wpe_out = self.wpe(torch.tensor(len(input_ids) - 1))
-            input_tensor = [input_ids[-1]]
+            input_tensor = input_ids[-1:]
         input_tensor = torch.tensor(input_tensor, dtype=torch.long)
         x = self.wte(input_tensor) + wpe_out
         return x.unsqueeze(0)
@@ -163,37 +158,38 @@ def generate(inputs, model, embeddings, n_tokens_to_generate, kvcache=None):
 
 vocab_size = 50257
 n_embd = 768
-n_head = 16
-n_layers = 24
+n_head = 12
+n_layers = 12
 n_position = 2048
-batch_size = 2
 
 
-tokenizer = GPT2Tokenizer.from_pretrained(
+tokenizer = AutoTokenizer.from_pretrained(
     "EleutherAI/gpt-neo-125M", is_split_into_words=True
 )
-input_text = "The computer is a machine that can perform complex calculations, and"
+input_text = "Hello, my dog is cute,"
 in_tokens = tokenizer.encode(input_text)
+GPT_model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M").eval()
 
-GPT_model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M")
-
-module = GPT2(vocab_size, n_embd, n_head, n_layers).eval()
+module = GPTneo(vocab_size, n_embd, n_head, n_layers).eval()
 embeddings = Embedding(vocab_size, n_position, n_embd).eval()
 
 dic_from = GPT_model.state_dict()
 dic_to = module.state_dict()
 dic_emb = embeddings.state_dict()
 
-
 for k, weight in dic_from.items():
+    new_name = k.replace("h.", "").replace("attention.", "")
     if "wte" in k or "wpe" in k:
         dic_emb[k[12:]] = weight
-    if k.replace("h.", "") in dic_to:
-        dic_to[k.replace("h.", "")] = weight
+    if "ln_f" in k:
+        dic_to[k[12:]] = weight
+    if new_name in dic_to:
+        dic_to[new_name] = weight
 
 module.load_state_dict(dic_to)
 embeddings.load_state_dict(dic_emb)
-out = generate(in_tokens, module, embeddings, 5)
+
+out = generate(in_tokens, module, embeddings, 10)
 generated_text = tokenizer.decode(out)
 full_string = "".join(generated_text)
 print(full_string)
