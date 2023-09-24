@@ -656,7 +656,9 @@ class TypeInferer(ASTVisitor):
                 # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
                 assert len(argBshape) == 2
                 assert argAshape[-1] == argBshape[-1]
-                assert argBshape[0] == new_args[2].shape[0]
+                # bias = True
+                if len(new_args) == 3:
+                    assert argBshape[0] == new_args[2].shape[0]
                 node.shape = argAshape[:-1] + argBshape[:-1]
             return node
         if op_name in {"transpose"}:

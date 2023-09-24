@@ -19,7 +19,7 @@ class GPTneo(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-    def forward(self, x, kvcache):
+    def forward(self, x, kvcache=None):
         if not kvcache:
             kvcache = [None] * len(self.transformer)
         presents = () if kvcache else None
@@ -58,7 +58,7 @@ class MLP(nn.Module):
         super(MLP, self).__init__()
         self.c_fc = nn.Linear(n_embd, hidden_dim)
         self.c_proj = nn.Linear(hidden_dim, output_dim)
-        self.activation = NewGELUActivation()
+        self.activation = nn.GELU()
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -144,12 +144,21 @@ class Embedding(nn.Module):
         return x.unsqueeze(0)
 
 
-def generate(inputs, model, embeddings, n_tokens_to_generate, kvcache=None):
+def generate(inputs, model, embeddings, n_tokens_to_generate):
     with torch.no_grad():
+        kvcache = None
+        i = 0
         for _ in tqdm(
             range(n_tokens_to_generate), "generating"
         ):  # auto-regressive decode loop
+            i += 1
             x = embeddings(inputs, kvcache)
+            print(x.shape)
+            llvm_mod = allo.frontend.from_pytorch(
+                model,
+                example_inputs=[x],
+                verbose=True,
+            )
             logits, kvcache = model(x, kvcache)  # model forward pass
             next_id = torch.argmax(logits[0, -1, :]).item()  # greedy sampling
             inputs.append(next_id)  # append prediction to input
@@ -166,7 +175,7 @@ n_position = 2048
 tokenizer = AutoTokenizer.from_pretrained(
     "EleutherAI/gpt-neo-125M", is_split_into_words=True
 )
-input_text = "Hello, my dog is cute,"
+input_text = "Hello, my dog is cute"
 in_tokens = tokenizer.encode(input_text)
 GPT_model = AutoModelForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M").eval()
 
@@ -189,7 +198,7 @@ for k, weight in dic_from.items():
 module.load_state_dict(dic_to)
 embeddings.load_state_dict(dic_emb)
 
-out = generate(in_tokens, module, embeddings, 10)
+out = generate(in_tokens, module, embeddings, 15)
 generated_text = tokenizer.decode(out)
 full_string = "".join(generated_text)
 print(full_string)

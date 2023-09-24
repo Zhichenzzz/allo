@@ -127,8 +127,9 @@ def sumpool(inp, filter, name=None):
     return np.sum(sub_matrices, axis=(4, 5))
 
 
-def linear(X, A, B, name=None):
-    # TODO: Handle bias=None
+def linear(X, A, B=None, name=None):
+    if B is None:
+        return matmul(X, A.T)
     return matmul(X, A.T) + B
 
 
