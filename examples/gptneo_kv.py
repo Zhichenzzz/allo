@@ -153,7 +153,6 @@ def generate(inputs, model, embeddings, n_tokens_to_generate):
         ):  # auto-regressive decode loop
             i += 1
             x = embeddings(inputs, kvcache)
-            print(x.shape)
             llvm_mod = allo.frontend.from_pytorch(
                 model,
                 example_inputs=[x],

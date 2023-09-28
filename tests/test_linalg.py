@@ -567,5 +567,19 @@ def test_triangular_matrix():
     np.testing.assert_allclose(outp, np_outp, atol=1e-5)
 
 
+@pytest.mark.parametrize("enable_tensor", [True, False])
+def test_concatenate(enable_tensor):
+    def concat(A: int32[3, 2, 15, 6], B: int32[3, 2, 5, 6]) -> int32[3, 2, 20, 6]:
+        C = allo.concat(A, B, axis=2)
+        return C
+
+    s = allo.customize(concat, enable_tensor=enable_tensor)
+    print(s.module)
+    mod = s.build()
+    np_A = np.random.randint(0, 10, size=(3, 2, 15, 6)).astype(np.int32)
+    np_B = np.random.randint(0, 10, size=(3, 2, 5, 6)).astype(np.int32)
+    np.testing.assert_allclose(concat(np_A, np_B), mod(np_A, np_B), rtol=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -154,3 +154,7 @@ def ones(shape, dtype=None):
 
 def tril(x):
     return np.tril(x)
+
+
+def concat(x, y, axis=0):
+    return np.concatenate((x, y), axis=axis)

@@ -707,6 +707,23 @@ class TypeInferer(ASTVisitor):
             else:
                 raise RuntimeError(f"Unsupported dtype {dtype}")
             return node
+        if op_name == "concat":
+            axis = node.keywords[0].value.value
+            if len(new_args[0].shape) != len(new_args[1].shape):
+                raise RuntimeError(
+                    f"Concatenation requires the same number of dimensions, got {len(new_args[0].shape)} and {len(new_args[1].shape)}"
+                )
+
+            for i in range(len(new_args[0].shape)):
+                if i != axis and new_args[0].shape[i] != new_args[1].shape[i]:
+                    raise RuntimeError(
+                        f"Concatenation requires the same shape except the concatenation axis {axis}, got {new_args[0].shape} and {new_args[1].shape}"
+                    )
+            shape = list(new_args[0].shape)
+            shape[axis] += new_args[1].shape[axis]
+            node.shape = tuple(shape)
+            node.dtype = new_args[0].dtype
+            return node
         raise RuntimeError(f"Unsupported linalg operation {op_name}")
 
     @staticmethod

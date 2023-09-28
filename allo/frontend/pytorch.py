@@ -136,6 +136,7 @@ class TorchBuilder:
             operator.truediv: "div",
             torch.matmul: "matmul",
             torch.ones: "ones",
+            torch.cat: "cat",
             math.sqrt: "sqrt",
             F.softmax: "softmax",
             F.linear: "linear",
@@ -145,6 +146,7 @@ class TorchBuilder:
             torch.tril: "tril",
         }.get(node.target)
         # Only nodes with shape need to be built.
+        print(node.target)
         return (
             getattr(self, f"build_{opcls}")(node)
             if "tensor_meta" in node.meta
