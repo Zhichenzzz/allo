@@ -4,12 +4,15 @@
 import operator
 import inspect
 import math
+import warnings
 
 try:
     import torch
     from torch import fx
     from torch.nn import functional as F
-    from torch.fx.passes.shape_prop import ShapeProp
+    from torch.fx.graph_module import GraphModule
+    from torch.fx.passes.shape_prop import ShapeProp, TensorMetadata
+    from .tracer import AlloTracer
 except ImportError:
     pass
 
@@ -24,16 +27,21 @@ def from_pytorch(model, example_inputs, verbose=False):
         p.name for i, p in enumerate(sig.parameters.values()) if i < len(example_inputs)
     ]
     concrete_args = {
-        p.name: p.default
-        for p in sig.parameters.values()
-        if p.name not in input_names and p.default is not inspect.Parameter.empty
+        p.name: p.default for p in sig.parameters.values() if p.name not in input_names
     }
     args = []
     args += example_inputs
     for item in concrete_args.values():
         args.append(item)
 
-    gm = fx.symbolic_trace(model, concrete_args=concrete_args)
+    tracer = AlloTracer(model, concrete_args=concrete_args)
+    graph = tracer.trace()
+    name = (
+        model.__class__.__name__
+        if isinstance(model, torch.nn.Module)
+        else model.__name__
+    )
+    gm = GraphModule(tracer.root, graph, name)
     ShapeProp(gm).propagate(*args)
     if verbose:
         print(gm.graph)
@@ -65,6 +73,7 @@ class TorchBuilder:
         self.input_args = []
         self.input_shapes = [x.shape for x in example_inputs]
         self.named_params = gm.named_parameters()
+        self.output = None
 
     def build(self):
         for node in self.gm.graph.nodes:
@@ -76,8 +85,7 @@ class TorchBuilder:
         # inputs
         res = f"def forward({', '.join(args)})".format()
         # outputs
-        # FIXME: Update return type (can use shape propagation)
-        res += f" -> float32[{', '.join([str(s) for s in self.input_shapes[0]])}]:\n"
+        res += f" -> {self.output}:\n"
         # global parameters
         if self.named_params:
             for name, param in self.named_params:
@@ -112,8 +120,12 @@ class TorchBuilder:
             torch.nn.GELU: "gelu",
             torch.nn.LayerNorm: "layernorm",
         }.get(type(module), None)
+
         if op is None:
             raise NotImplementedError("Unsupported module")
+        if op == "linear":
+            bias = True if module.bias is not None else None
+            return getattr(self, f"build_linear")(node, bias)
         return getattr(self, f"build_{op}")(node)
 
     def build_call_function(self, node):
@@ -123,14 +135,18 @@ class TorchBuilder:
             operator.mul: "mul",
             operator.truediv: "div",
             torch.matmul: "matmul",
+            torch.ones: "ones",
+            torch.cat: "cat",
             math.sqrt: "sqrt",
             F.softmax: "softmax",
             F.linear: "linear",
             F.gelu: "gelu",
             F.relu: "relu",
             F.dropout: "identity",
+            torch.tril: "tril",
         }.get(node.target)
         # Only nodes with shape need to be built.
+        print(node.target)
         return (
             getattr(self, f"build_{opcls}")(node)
             if "tensor_meta" in node.meta
@@ -148,21 +164,43 @@ class TorchBuilder:
         )
 
     def build_output(self, node):
+        if len(node.args) > 1:
+            warnings.warn(
+                "Currently we only support return a single value", RuntimeWarning
+            )
+        if isinstance(node.meta["tensor_meta"], TensorMetadata):
+            output_tensor_meta = node.meta["tensor_meta"]
+        elif isinstance(node.meta["tensor_meta"], tuple):
+            output_tensor_meta = node.meta["tensor_meta"][0]
+        elif isinstance(node.meta["tensor_meta"], dict):
+            output_tensor_meta = list(node.meta["tensor_meta"].values())[0]
+        else:
+            raise NotImplementedError("Unsupported output type")
+        shape = str(list(output_tensor_meta.shape))
+        dtype = str(output_tensor_meta.dtype)[6:]
+        self.output = dtype + shape
+
         name = get_var_name(node.args[0])
-        # Currently we only support return a single value
         if isinstance(name, (tuple, str)):
             return f"return ({name[0] if isinstance(name, tuple) else name})"
         if isinstance(name, dict):
-            items = []
-            for item in name.values():
-                items.append(item)
-            return f"return ({items[0]})"
+            return f"return ({list(name.values())[0]})"
         raise NotImplementedError("Unsupported output type")
 
     def build_add(self, node):
         lhs = get_var_name(node.args[0])
         rhs = get_var_name(node.args[1])
         return f"{node.name} = {lhs} + {rhs}"
+
+    def build_sub(self, node):
+        lhs = get_var_name(node.args[0])
+        rhs = get_var_name(node.args[1])
+        return f"{node.name} = {lhs} - {rhs}"
+
+    def build_mul(self, node):
+        lhs = get_var_name(node.args[0])
+        rhs = get_var_name(node.args[1])
+        return f"{node.name} = {lhs} * {rhs}"
 
     def build_matmul(self, node):
         lhs = get_var_name(node.args[0])
@@ -184,12 +222,14 @@ class TorchBuilder:
         inp = get_var_name(node.args[0])
         return f"{node.name} = dsl.relu({inp})"
 
-    def build_linear(self, node):
+    def build_linear(self, node, bias):
         target_name = node.target.replace(".", "_")
         inp = get_var_name(node.args[0])
         weight = get_var_name(target_name + "_weight")
-        bias = get_var_name(target_name + "_bias")
-        return f"{node.name} = dsl.linear({inp}, {weight}, {bias})"
+        if bias:
+            bias = get_var_name(target_name + "_bias")
+            return f"{node.name} = dsl.linear({inp}, {weight}, {bias})"
+        return f"{node.name} = dsl.linear({inp}, {weight})"
 
     def build_gelu(self, node):
         inp = get_var_name(node.args[0])
@@ -234,3 +274,14 @@ class TorchBuilder:
     def build_identity(self, node):
         inp = get_var_name(node.args[0])
         return f"{node.name} = {inp}"
+
+    def build_ones(self, node):
+        shape = tuple(node.meta["tensor_meta"].shape)
+        dtype = node.meta["tensor_meta"].dtype
+        if str(dtype).startswith("torch."):
+            dtype = str(dtype)[6:]
+        return f"{node.name} = dsl.ones({shape}, dtype={dtype})"
+
+    def build_tril(self, node):
+        inp = get_var_name(node.args[0])
+        return f"{node.name} = dsl.tril({inp})"

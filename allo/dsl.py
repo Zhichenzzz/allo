@@ -127,8 +127,9 @@ def sumpool(inp, filter, name=None):
     return np.sum(sub_matrices, axis=(4, 5))
 
 
-def linear(X, A, B, name=None):
-    # TODO: Handle bias=None
+def linear(X, A, B=None, name=None):
+    if B is None:
+        return matmul(X, A.T)
     return matmul(X, A.T) + B
 
 
@@ -145,3 +146,15 @@ def layernorm(x, gamma, beta, eps: float = 1e-5):
 
 def gelu(x):
     return 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+
+
+def ones(shape, dtype=None):
+    return np.ones(shape, dtype=dtype)
+
+
+def tril(x):
+    return np.tril(x)
+
+
+def concat(x, y, axis=0):
+    return np.concatenate((x, y), axis=axis)

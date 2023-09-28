@@ -656,7 +656,9 @@ class TypeInferer(ASTVisitor):
                 # https://pytorch.org/docs/stable/generated/torch.nn.Linear.html
                 assert len(argBshape) == 2
                 assert argAshape[-1] == argBshape[-1]
-                assert argBshape[0] == new_args[2].shape[0]
+                # bias = True
+                if len(new_args) == 3:
+                    assert argBshape[0] == new_args[2].shape[0]
                 node.shape = argAshape[:-1] + argBshape[:-1]
             return node
         if op_name in {"transpose"}:
@@ -685,8 +687,41 @@ class TypeInferer(ASTVisitor):
             node.shape = axes
             node.dtype = new_args[0].dtype
             return node
-        if op_name in {"layernorm", "gelu"}:
+        if op_name in {"layernorm", "gelu", "tril"}:
             node.shape = new_args[0].shape
+            node.dtype = new_args[0].dtype
+            return node
+        if op_name == "ones":
+            axes = compile(ast.Expression(new_args[0]), "", "eval")
+            # pylint: disable=eval-used
+            axes = eval(axes)
+            node.shape = axes
+            assert (
+                node.keywords[0].arg == "dtype"
+            ), f"Only support `dtype` keyword argument for {op_name}"
+            dtype = node.keywords[0].value.id
+            if dtype.startswith("int"):
+                node.dtype = int32
+            elif dtype.startswith("float"):
+                node.dtype = float32
+            else:
+                raise RuntimeError(f"Unsupported dtype {dtype}")
+            return node
+        if op_name == "concat":
+            axis = node.keywords[0].value.value
+            if len(new_args[0].shape) != len(new_args[1].shape):
+                raise RuntimeError(
+                    f"Concatenation requires the same number of dimensions, got {len(new_args[0].shape)} and {len(new_args[1].shape)}"
+                )
+
+            for i in range(len(new_args[0].shape)):
+                if i != axis and new_args[0].shape[i] != new_args[1].shape[i]:
+                    raise RuntimeError(
+                        f"Concatenation requires the same shape except the concatenation axis {axis}, got {new_args[0].shape} and {new_args[1].shape}"
+                    )
+            shape = list(new_args[0].shape)
+            shape[axis] += new_args[1].shape[axis]
+            node.shape = tuple(shape)
             node.dtype = new_args[0].dtype
             return node
         raise RuntimeError(f"Unsupported linalg operation {op_name}")
