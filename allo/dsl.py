@@ -158,3 +158,6 @@ def tril(x):
 
 def concat(x, y, axis=0):
     return np.concatenate((x, y), axis=axis)
+
+def zeros(shape, dtype=None):
+    return np.zeros(shape, dtype=dtype)

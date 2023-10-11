@@ -301,4 +301,5 @@ def test_broadcast_uint():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    # pytest.main([__file__])
+    test_nested_func_slicing_arg()

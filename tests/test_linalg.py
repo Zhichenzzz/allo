@@ -592,4 +592,4 @@ def test_concatenate(enable_tensor):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    test_concatenate(False)

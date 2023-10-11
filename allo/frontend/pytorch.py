@@ -52,7 +52,9 @@ def from_pytorch(model, example_inputs, verbose=False):
     for name, param in gm.named_parameters():
         new_name = "g_" + name.replace(".", "_")
         global_vars.update({new_name: param.detach().numpy()})
-
+    for name, buffer in gm.named_buffers():
+        new_name = "g_" + name.replace(".", "_")
+        global_vars.update({new_name: buffer.detach().numpy()})
     builder = TorchBuilder(gm, example_inputs)
     code = builder.build()
     s = customize(code, verbose=verbose, global_vars=global_vars)
@@ -66,31 +68,70 @@ def get_var_name(node):
     return node.name if isinstance(node, fx.Node) else node
 
 
+def slice_to_string(slice_obj):
+    start_str = str(slice_obj.start) if slice_obj.start is not None else ""
+    stop_str = str(slice_obj.stop) if slice_obj.stop is not None else ""
+    step_str = str(slice_obj.step) if slice_obj.step is not None else ""
+
+    if step_str:
+        return f"{start_str}:{stop_str}:{step_str}"
+    elif stop_str:
+        return f"{start_str}:{stop_str}"
+    elif start_str:
+        return f"{start_str}:"
+    else:
+        return ":"
+
+
 class TorchBuilder:
     def __init__(self, gm, example_inputs):
         self.gm = gm
         self.code = []
+        self.input_names = []
         self.input_args = []
-        self.input_shapes = [x.shape for x in example_inputs]
+        self.input_shapes = []
+        self.example_inputs = example_inputs
         self.named_params = gm.named_parameters()
-        self.output = None
+        self.named_buffers = gm.named_buffers()
+        self.output = []
 
     def build(self):
         for node in self.gm.graph.nodes:
             self(node)
+        for i, x in enumerate(self.example_inputs):
+            if isinstance(x, torch.Tensor):
+                self.input_shapes.append(x.shape)
+                self.input_args.append(self.input_names[i])
+            elif isinstance(x, tuple) or isinstance(x, list):
+                input_name = self.input_names[i]
+                for num, item in enumerate(x):
+                    if isinstance(item, torch.Tensor):
+                        self.input_shapes.append(item.shape)
+                        self.input_args.append(f"{input_name}_{num}")
+                    else:
+                        raise NotImplementedError("Unsupported input type")
+            elif isinstance(x, int):
+                self.input_shapes.append(None)
+                self.input_args.append(self.input_names[i])
         args = [
             f"{name}: float32[{', '.join([str(s) for s in shape])}]"
+            if shape
+            else f"{name}: int32"
             for name, shape in zip(self.input_args, self.input_shapes)
         ]
         # inputs
         res = f"def forward({', '.join(args)})".format()
         # outputs
-        res += f" -> {self.output}:\n"
+        res += f" -> ({', '.join(self.output)}):\n"
         # global parameters
         if self.named_params:
             for name, param in self.named_params:
                 new_name = name.replace(".", "_")
                 res += f"  {new_name}: float32[{', '.join([str(s) for s in param.shape])}] = g_{new_name}\n"
+        if self.named_buffers:
+            for name, buffer in self.named_buffers:
+                new_name = name.replace(".", "_")
+                res += f"  {new_name}: float32[{', '.join([str(s) for s in buffer.shape])}] = g_{new_name}\n"
         # function body
         for line in self.code:
             res += f"  {line}\n"
@@ -107,10 +148,15 @@ class TorchBuilder:
         return dict(self.gm.named_modules())[name]
 
     def build_placeholder(self, node):
-        self.input_args.append(node.name)
+        self.input_names.append(node.name)
 
     def build_getattr(self, node):
         pass
+
+    def build_get_attr(self, node):
+        for name, buffer in self.gm.named_buffers():
+            if node.target == name:
+                return f"{node.name} = dsl.copy({node.target})"
 
     def build_call_module(self, node):
         module = self.get_module(node.target)
@@ -133,8 +179,10 @@ class TorchBuilder:
             operator.sub: "sub",
             operator.mul: "mul",
             operator.truediv: "div",
+            operator.getitem: "getitem",
             torch.matmul: "matmul",
             torch.ones: "ones",
+            torch.zeros: "zeros",
             math.sqrt: "sqrt",
             F.softmax: "softmax",
             F.linear: "linear",
@@ -142,11 +190,14 @@ class TorchBuilder:
             F.relu: "relu",
             F.dropout: "identity",
             torch.tril: "tril",
+            torch.cat: "concat",
+            torch.narrow: "narrow",
         }.get(node.target)
         # Only nodes with shape need to be built.
         return (
             getattr(self, f"build_{opcls}")(node)
             if "tensor_meta" in node.meta
+            or (opcls == "add" and node.meta["type"] is not torch.Size)
             else None
         )
 
@@ -161,32 +212,46 @@ class TorchBuilder:
         )
 
     def build_output(self, node):
-        if len(node.args) > 1:
-            warnings.warn(
-                "Currently we only support return a single value", RuntimeWarning
-            )
-        if isinstance(node.meta["tensor_meta"], TensorMetadata):
-            output_tensor_meta = node.meta["tensor_meta"]
-        elif isinstance(node.meta["tensor_meta"], tuple):
-            output_tensor_meta = node.meta["tensor_meta"][0]
-        elif isinstance(node.meta["tensor_meta"], dict):
-            output_tensor_meta = list(node.meta["tensor_meta"].values())[0]
-        else:
-            raise NotImplementedError("Unsupported output type")
-        shape = str(list(output_tensor_meta.shape))
-        dtype = str(output_tensor_meta.dtype)[6:]
-        self.output = dtype + shape
+        for output in node.meta["tensor_meta"]:
+            if isinstance(output, TensorMetadata):
+                output_tensor_meta = output
+                shape = str(list(output_tensor_meta.shape))
+                dtype = str(output_tensor_meta.dtype)[6:]
+                self.output.append(dtype + shape)
+            elif isinstance(output, tuple) or isinstance(output, list):
+                for item in output:
+                    if isinstance(item, TensorMetadata):
+                        output_tensor_meta = item
+                        shape = str(list(output_tensor_meta.shape))
+                        dtype = str(output_tensor_meta.dtype)[6:]
+                        self.output.append(dtype + shape)
+                    else:
+                        raise NotImplementedError("Unsupported output type")
+            elif isinstance(output, dict):
+                output_tensor_meta = list(output.values())[0]
+                shape = str(list(output_tensor_meta.shape))
+                dtype = str(output_tensor_meta.dtype)[6:]
+                self.output.append(dtype + shape)
+            else:
+                raise NotImplementedError("Unsupported output type")
 
         name = get_var_name(node.args[0])
-        if isinstance(name, (tuple, str)):
-            return f"return ({name[0] if isinstance(name, tuple) else name})"
-        if isinstance(name, dict):
-            return f"return ({list(name.values())[0]})"
-        raise NotImplementedError("Unsupported output type")
+        return_name = (
+            str(name)
+            .replace("(", "")
+            .replace(")", "")
+            .replace("[", "")
+            .replace("]", "")
+        )
+        return f"return ({return_name})"
 
     def build_add(self, node):
         lhs = get_var_name(node.args[0])
         rhs = get_var_name(node.args[1])
+        if node.meta["type"] is int:
+            return f"{node.name}: int32 ={lhs} + {rhs}"
+        elif node.meta["type"] is float:
+            return f"{node.name}: float32 ={lhs} + {rhs}"
         return f"{node.name} = {lhs} + {rhs}"
 
     def build_sub(self, node):
@@ -279,6 +344,35 @@ class TorchBuilder:
             dtype = str(dtype)[6:]
         return f"{node.name} = dsl.ones({shape}, dtype={dtype})"
 
+    def build_zeros(self, node):
+        shape = tuple(node.meta["tensor_meta"].shape)
+        dtype = node.meta["tensor_meta"].dtype
+        if str(dtype).startswith("torch."):
+            dtype = str(dtype)[6:]
+        return f"{node.name} = dsl.zeros({shape}, dtype={dtype})"
+
     def build_tril(self, node):
         inp = get_var_name(node.args[0])
         return f"{node.name} = dsl.tril({inp})"
+
+    def build_concat(self, node):
+        shape_len = len(node.meta["tensor_meta"].shape)
+        tensor_A = get_var_name(node.args[0][0])
+        tensor_B = get_var_name(node.args[0][1])
+        dim = node.kwargs["dim"] + (node.kwargs["dim"] < 0) * shape_len
+        return f"{node.name} = dsl.concat({tensor_A}, {tensor_B}, axis={dim})"
+
+    def build_getitem(self, node):
+        if isinstance(node.args[1], tuple):
+            args =[]
+            for slice_item in node.args[1]:
+                if isinstance(slice_item,slice ):
+                    args.append(slice_to_string(slice_item))
+                else:
+                    raise NotImplementedError("Unsupported slice type")
+            slc = ", ".join(args)
+            return f"{node.name} = {get_var_name(node.args[0])}[{slc}]"               
+        elif isinstance(node.args[1], int):
+            inp = get_var_name(node.args[0])
+            index = node.args[1]
+            return f"{node.name} = dsl.copy({inp}_{index})"

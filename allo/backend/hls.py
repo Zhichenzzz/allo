@@ -16,7 +16,11 @@ from hcl_mlir.passmanager import PassManager
 
 from .vitis import codegen_host, postprocess_hls_code, generate_description_file
 from .report import parse_xml
-from ..passes import _mlir_lower_pipeline, generate_input_output_buffers
+from ..passes import (
+    _mlir_lower_pipeline,
+    generate_input_output_buffers,
+    decompose_library_function,
+)
 from ..harness.makefile_gen.makegen import generate_makefile
 from ..ir.transform import find_func_in_module
 
@@ -115,6 +119,7 @@ class HLSModule:
             hcl_d.register_dialect(ctx)
             self.module = Module.parse(str(mod), ctx)
             self.func = find_func_in_module(self.module, top_func_name)
+            self.module = decompose_library_function(self.module)
             if platform == "vitis_hls":
                 generate_input_output_buffers(self.func, flatten=True)
             _mlir_lower_pipeline(self.module, canonicalize=True, lower_linalg=True)

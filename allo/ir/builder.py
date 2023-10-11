@@ -855,37 +855,65 @@ class ASTTransformer(ASTBuilder):
     def build_slices(ctx, node, in_shape):
         # caculate the static offsets, sizes, strides for ExtractSlice and InsertSlice
         slices = node.slice.dims
-        static_offsets = []
-        static_sizes = []
-        static_strides = []
+        offsets = []
+        sizes = []
+        strides = []
         for index, size in zip(slices, in_shape):
             if isinstance(index, ast.Slice):
-                lower = 0 if index.lower is None else build_stmt(ctx, index.lower).val
-                upper = (
-                    size if index.upper is None else build_stmt(ctx, index.upper).val
-                )
+                if index.lower is None:
+                    lower = MockConstant(0,ctx)
+                elif isinstance(index.lower, ast.Constant) or isinstance(index.lower, ast.Name):
+                    lower = build_stmt(ctx, index.lower)
+                if index.upper is None:
+                    upper = MockConstant(size,ctx)
+                elif isinstance(index.upper, ast.Constant) or isinstance(index.upper, ast.Name):
+                    upper = build_stmt(ctx, index.upper)
+
                 if index.step is None:
-                    step = 1
-                elif isinstance(index.step, ast.Constant):
-                    step = index.step.value
-                else:
-                    raise RuntimeError("Unsupported step type")
+                    step = MockConstant(1,ctx)
+                elif isinstance(index.step, ast.Constant)or isinstance(index.lower, ast.Name):
+                    step = build_stmt(ctx, index.step)
+
             elif isinstance(index, ast.Index):
                 lower = index.value.value
                 upper = lower + 1
                 step = 1
-            if lower < 0 or upper < 0:
-                raise RuntimeError("Unsupported negative index")
-            if lower > size or upper > size:
-                raise RuntimeError("Index out of range")
-            if step <= 0:
-                raise RuntimeError("Unsupported negative step")
-            if step > upper - lower:
-                raise RuntimeError("Step larger than range")
-            static_offsets.append(lower)
-            static_sizes.append((upper - lower) // step)
-            static_strides.append(step)
-        return static_offsets, static_sizes, static_strides
+            # if lower < 0 or upper < 0:
+            #     raise RuntimeError("Unsupported negative index")
+            # if lower > size or upper > size:
+            #     raise RuntimeError("Index out of range")
+            # if step <= 0:
+            #     raise RuntimeError("Unsupported negative step")
+            # if step > upper - lower:
+            #     raise RuntimeError("Step larger than range")
+            
+            sub = arith_d.SubIOp(
+                upper.result,
+                lower.result,
+                ip=ctx.get_ip(),
+            )
+            stride = arith_d.DivSIOp(
+                sub.result,
+                step.result,
+                ip=ctx.get_ip(),
+            )
+            lower = ASTTransformer.build_cast_op(
+                ctx, lower, node.dtype, Index()
+            )
+            stride = ASTTransformer.build_cast_op(
+                ctx, stride, node.dtype, Index()
+            )
+            step = ASTTransformer.build_cast_op(
+                ctx, step, node.dtype, Index()
+            )
+            offsets.append(lower.result)
+            sizes.append(stride.result)
+            strides.append(step.result)
+        for i in range(len(offsets)):
+            print(offsets[i])
+            print(sizes[i])
+            print(strides[i])
+        return offsets, sizes, strides
 
     @staticmethod
     def build_tensor_access(ctx, node, val=None):
@@ -894,22 +922,26 @@ class ASTTransformer(ASTBuilder):
             dtype = RankedTensorType(value.result.type).element_type
             in_shape = RankedTensorType(value.result.type).shape
             (
-                static_offsets,
-                static_sizes,
-                static_strides,
+                offsets,
+                sizes,
+                strides,
             ) = ASTTransformer.build_slices(ctx, node, in_shape)
-            result = RankedTensorType.get(static_sizes, dtype)
+            # result = RankedTensorType.get(sizes, dtype)
+            # result = RankedTensorType.get([0,0,0], dtype)
+            result = MLIRType.parse("tensor<?x?x?xi32>")
             # pylint: disable=no-else-return
+            min_int64 = np.iinfo(np.int64).min
+
             if isinstance(node.ctx, ast.Load):
                 return tensor_d.ExtractSliceOp(
                     result=result,
                     source=value.result,
-                    static_sizes=static_sizes,
-                    static_strides=static_strides,
-                    static_offsets=static_offsets,
-                    offsets=[],
-                    sizes=[],
-                    strides=[],
+                    static_sizes=[min_int64,min_int64,min_int64],
+                    static_strides=[min_int64,min_int64,min_int64],
+                    static_offsets=[min_int64,min_int64,min_int64],
+                    offsets=offsets,
+                    sizes=sizes,
+                    strides=strides,
                     ip=ctx.get_ip(),
                 )
             else:  # ast.Store
@@ -1447,12 +1479,12 @@ class ASTTransformer(ASTBuilder):
                 )
                 return
             fn_name = obj.__name__
-            if fn_name == "ones":
+            if fn_name == "ones" or fn_name == "zeros":
                 shape = node.shape
                 dtype = node.dtype
                 with ctx.get_ip():
                     alloc_op = ASTTransformer.build_array(ctx, dtype, shape)
-                    one = MockConstant(1, ctx)
+                    one = MockConstant(1, ctx) if fn_name == "ones" else MockConstant(0, ctx)
                     one = ASTTransformer.build_cast_op(ctx, one, Int(32), node.dtype)
                     # pylint: disable=unexpected-keyword-arg
                     ones = linalg_d.fill(one.result, outs=[alloc_op.result])
